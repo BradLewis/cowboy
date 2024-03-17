@@ -9,6 +9,7 @@ import gleam/http/request.{Request}
 import gleam/bytes_builder.{type BytesBuilder}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid}
+import gleam/http/cookie
 
 type CowboyRequest
 
@@ -25,6 +26,21 @@ fn cowboy_reply(
   body: BytesBuilder,
   request: CowboyRequest,
 ) -> CowboyRequest
+
+@external(erlang, "cowboy_req", "set_resp_cookie")
+fn erlang_set_resp_cookie(name: String, value: String, request: CowboyRequest, opts: Dict(String, String) ) -> CowboyRequest
+
+fn set_resp_cookie(cookie_header: #(String, String), request: CowboyRequest) -> CowboyRequest {
+  let cookie_info = cookie.parse(cookie_header.1)
+  let result = list.pop(cookie_info, fn(_){True})
+  case result {
+   Ok(#(#(name, value), opts)) -> erlang_set_resp_cookie(name, value, request, 
+      opts
+      |> dict.from_list
+    )
+    _ -> request
+  }
+}
 
 @external(erlang, "cowboy_req", "method")
 fn erlang_get_method(request: CowboyRequest) -> Dynamic
@@ -77,28 +93,10 @@ fn get_host(request: CowboyRequest) -> String
 @external(erlang, "cowboy_req", "port")
 fn get_port(request: CowboyRequest) -> Int
 
-fn proplist_get_all(input: List(#(a, b)), key: a) -> List(b) {
-  list.filter_map(
-    input,
-    fn(item) {
-      case item {
-        #(k, v) if k == key -> Ok(v)
-        _ -> Error(Nil)
-      }
-    },
-  )
-}
-
-// In cowboy all header values are strings except set-cookie, which is a
-// list. This list has a special-case in Cowboy so we need to set it
-// correctly.
-// https://github.com/gleam-lang/cowboy/issues/3
 fn cowboy_format_headers(headers: List(Header)) -> Dict(String, Dynamic) {
-  let set_cookie_headers = proplist_get_all(headers, "set-cookie")
   headers
   |> list.map(pair.map_second(_, dynamic.from))
   |> dict.from_list
-  |> dict.insert("set-cookie", dynamic.from(set_cookie_headers))
 }
 
 fn service_to_handler(
@@ -118,8 +116,19 @@ fn service_to_handler(
         scheme: get_scheme(request),
       ))
     let status = response.status
+    // We split the cookie headers from the rest of the headers
+    // This is due to a change in cowboyh 2.11.0 which means cookie headers must
+    // now be set using cowboy_req:set_resp_cookie
+    let #(headers, cookie_headers) = list.partition(response.headers, fn(header) { 
+      case header {
+        #(k, _) -> k != "set-cookie"
+      }
+    })
 
-    let headers = cowboy_format_headers(response.headers)
+    let headers = cowboy_format_headers(headers)
+    let request = list.fold(cookie_headers, request, fn(req, c) {
+      set_resp_cookie(c, req)
+    })
     let body = response.body
     cowboy_reply(status, headers, body, request)
   }
