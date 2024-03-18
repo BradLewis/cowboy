@@ -9,7 +9,8 @@ import gleam/http/request.{Request}
 import gleam/bytes_builder.{type BytesBuilder}
 import gleam/dynamic.{type Dynamic}
 import gleam/erlang/process.{type Pid}
-import gleam/http/cookie
+import gleam/regex
+import gleam/string
 
 type CowboyRequest
 
@@ -28,17 +29,61 @@ fn cowboy_reply(
 ) -> CowboyRequest
 
 @external(erlang, "cowboy_req", "set_resp_cookie")
-fn erlang_set_resp_cookie(name: String, value: String, request: CowboyRequest, opts: Dict(String, String) ) -> CowboyRequest
+fn erlang_set_resp_cookie(name: String, value: Dynamic, request: CowboyRequest, opts: Dict(String, Dynamic) ) -> CowboyRequest
 
 fn set_resp_cookie(cookie_header: #(String, String), request: CowboyRequest) -> CowboyRequest {
-  let cookie_info = cookie.parse(cookie_header.1)
+  let cookie_info = parse_cookie_header(cookie_header.1)
   let result = list.pop(cookie_info, fn(_){True})
   case result {
-   Ok(#(#(name, value), opts)) -> erlang_set_resp_cookie(name, value, request, 
-      opts
-      |> dict.from_list
-    )
+   Ok(#(#(name, value), opts)) -> erlang_set_resp_cookie(name, value, request, dict.from_list(opts))
     _ -> request
+  }
+}
+
+fn parse_cookie_header(header: String) -> List(#(String, Dynamic)) {
+  let assert Ok(re) = regex.from_string("[,;]")
+  regex.split(re, header)
+  |> list.filter_map(fn(pair) {
+    case string.split_once(string.trim(pair), "=") {
+      Ok(#("", _)) -> Error(Nil)
+      Ok(#(key, value)) -> {
+        let key = string.trim(key)
+        let value = string.trim(value)
+        use _ <- result.then(check_token(key))
+        use _ <- result.then(check_token(value))
+        let k = case key {
+          "Max-Age" -> "max_age"
+          "Expires" -> "expires"
+          "Domain" -> "domain"
+          "Path" -> "path"
+          "HttpOnly" -> "http_only"
+          "Secure" -> "secure"
+          "SameSite" -> "same_site"
+          _ -> key
+        }
+        Ok(#(k, dynamic.from(value)))
+      }
+      // If we have an error, that means we have an attribute without a value
+      Error(Nil) -> {
+        case string.trim(pair) {
+          "HttpOnly" -> Ok(#("http_only", dynamic.from(True)))
+          "Secure" -> Ok(#("secure", dynamic.from(True)))
+          _ -> Error(Nil)
+        }
+      }
+    }
+  })
+}
+
+fn check_token(token: String) -> Result(Nil, Nil) {
+  case string.pop_grapheme(token) {
+    Error(Nil) -> Ok(Nil)
+    Ok(#(" ", _)) -> Error(Nil)
+    Ok(#("\t", _)) -> Error(Nil)
+    Ok(#("\r", _)) -> Error(Nil)
+    Ok(#("\n", _)) -> Error(Nil)
+    Ok(#("\f", _)) -> Error(Nil)
+    Ok(#(_, rest)) -> check_token(rest)
   }
 }
 
